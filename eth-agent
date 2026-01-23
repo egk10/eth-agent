@@ -1,0 +1,640 @@
+#!/bin/bash
+# Ethereum Node Management Agent
+# Manages Ethereum nodes over Tailscale SSH
+
+AGENT_DIR="$HOME/.eth-agent"
+NODES_FILE="$AGENT_DIR/nodes.json"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+# Get node IPs from memory
+get_nodes() {
+    jq -r '.nodes[] | "\(.name):\(.tailscale_ip)"' "$NODES_FILE"
+}
+
+get_node_ip() {
+    local name=$1
+    jq -r ".nodes[] | select(.name==\"$name\") | .tailscale_ip" "$NODES_FILE"
+}
+
+get_all_ips() {
+    jq -r '.nodes[].tailscale_ip' "$NODES_FILE"
+}
+
+get_all_names() {
+    jq -r '.nodes[].name' "$NODES_FILE"
+}
+
+# Run command on single node
+run_on_node() {
+    local node=$1
+    shift
+    local cmd="$@"
+    local ip=$(get_node_ip "$node")
+
+    if [ -z "$ip" ]; then
+        echo -e "${RED}Node '$node' not found${NC}"
+        return 1
+    fi
+
+    echo -e "${BLUE}[$node]${NC} Running: $cmd"
+    ssh -o ConnectTimeout=10 "$node" "$cmd"
+}
+
+# Run command on all nodes
+run_on_all() {
+    local cmd="$@"
+    echo -e "${YELLOW}Running on all nodes:${NC} $cmd"
+    echo "----------------------------------------"
+
+    for node in $(get_all_names); do
+        local ip=$(get_node_ip "$node")
+        echo -e "${BLUE}[$node]${NC} ($ip)"
+        ssh -o ConnectTimeout=10 "$node" "$cmd" 2>&1 | sed 's/^/  /'
+        echo ""
+    done
+}
+
+# Check status of all nodes
+status() {
+    echo -e "${YELLOW}Checking node status...${NC}"
+    echo "----------------------------------------"
+
+    for node in $(get_all_names); do
+        local ip=$(get_node_ip "$node")
+        if ssh -o ConnectTimeout=5 "$node" "echo ok" &>/dev/null; then
+            echo -e "${GREEN}[ONLINE]${NC}  $node ($ip)"
+        else
+            echo -e "${RED}[OFFLINE]${NC} $node ($ip)"
+        fi
+    done
+}
+
+# Check Ethereum client status
+eth_status() {
+    echo -e "${YELLOW}Checking Ethereum client status...${NC}"
+    echo "----------------------------------------"
+
+    run_on_all "systemctl is-active --quiet geth && echo 'geth: running' || echo 'geth: stopped'; \
+                systemctl is-active --quiet lighthouse && echo 'lighthouse: running' || echo 'lighthouse: stopped'; \
+                systemctl is-active --quiet prysm && echo 'prysm: running' || echo 'prysm: stopped'" 2>/dev/null
+}
+
+# Update system packages on all nodes
+update_all() {
+    echo -e "${YELLOW}Updating all nodes...${NC}"
+    run_on_all "sudo apt update && sudo apt upgrade -y"
+}
+
+# Update single node
+update_node() {
+    local node=$1
+    if [ -z "$node" ]; then
+        echo "Usage: eth-agent update-node <node-name>"
+        return 1
+    fi
+    run_on_node "$node" "sudo apt update && sudo apt upgrade -y"
+}
+
+# Restart Ethereum services
+restart_eth() {
+    local node=$1
+    if [ -z "$node" ]; then
+        echo -e "${YELLOW}Restarting Ethereum services on all nodes...${NC}"
+        run_on_all "sudo systemctl restart geth lighthouse prysm 2>/dev/null || true"
+    else
+        run_on_node "$node" "sudo systemctl restart geth lighthouse prysm 2>/dev/null || true"
+    fi
+}
+
+# ============================================
+# ETH-DOCKER COMMANDS
+# ============================================
+
+# Update eth-docker on all nodes
+ethd_update_all() {
+    echo -e "${YELLOW}Updating eth-docker on all nodes...${NC}"
+    echo -e "${YELLOW}This will run 'ethd update --non-interactive && ethd up' on each node${NC}"
+    echo "----------------------------------------"
+
+    for node in $(get_all_names); do
+        local ip=$(get_node_ip "$node")
+        echo -e "${BLUE}[$node]${NC} ($ip)"
+        echo -e "  ${YELLOW}Running ethd update --non-interactive...${NC}"
+        ssh -o ConnectTimeout=300 "$node" "cd ~/eth-docker && ./ethd update --non-interactive" 2>&1 | sed 's/^/  /'
+        echo -e "  ${YELLOW}Running ethd up...${NC}"
+        ssh -o ConnectTimeout=60 "$node" "cd ~/eth-docker && ./ethd up -d" 2>&1 | sed 's/^/  /'
+        # Restart Hyperdrive services if installed (ensures containers restart after Docker daemon restart)
+        echo -e "  ${YELLOW}Checking for Hyperdrive...${NC}"
+        ssh -o ConnectTimeout=30 "$node" "if [ -d ~/.hyperdrive ] && command -v hyperdrive &>/dev/null; then echo 'Restarting Hyperdrive services...'; hyperdrive service start; else echo 'Hyperdrive not installed, skipping'; fi" 2>&1 | sed 's/^/  /'
+        echo -e "  ${GREEN}Done${NC}"
+        echo ""
+    done
+}
+
+# Update eth-docker on single node
+ethd_update_node() {
+    local node=$1
+    if [ -z "$node" ]; then
+        echo "Usage: eth-agent ethd-update-node <node-name>"
+        list
+        return 1
+    fi
+    local ip=$(get_node_ip "$node")
+    if [ -z "$ip" ]; then
+        echo -e "${RED}Node '$node' not found${NC}"
+        return 1
+    fi
+
+    echo -e "${BLUE}[$node]${NC} Updating eth-docker..."
+    echo -e "  ${YELLOW}Running ethd update --non-interactive...${NC}"
+    ssh -o ConnectTimeout=300 "$node" "cd ~/eth-docker && ./ethd update --non-interactive" 2>&1 | sed 's/^/  /'
+    echo -e "  ${YELLOW}Running ethd up...${NC}"
+    ssh -o ConnectTimeout=60 "$node" "cd ~/eth-docker && ./ethd up -d" 2>&1 | sed 's/^/  /'
+    # Restart Hyperdrive services if installed (ensures containers restart after Docker daemon restart)
+    echo -e "  ${YELLOW}Checking for Hyperdrive...${NC}"
+    ssh -o ConnectTimeout=30 "$node" "if [ -d ~/.hyperdrive ] && command -v hyperdrive &>/dev/null; then echo 'Restarting Hyperdrive services...'; hyperdrive service start; else echo 'Hyperdrive not installed, skipping'; fi" 2>&1 | sed 's/^/  /'
+    echo -e "  ${GREEN}Done${NC}"
+}
+
+# Check eth-docker container status on all nodes
+ethd_status() {
+    echo -e "${YELLOW}Checking eth-docker status on all nodes...${NC}"
+    echo "----------------------------------------"
+
+    for node in $(get_all_names); do
+        local ip=$(get_node_ip "$node")
+        echo -e "${BLUE}[$node]${NC} ($ip)"
+        ssh -o ConnectTimeout=10 "$node" "cd ~/eth-docker && docker compose ps --format 'table {{.Name}}\t{{.Status}}'" 2>&1 | sed 's/^/  /'
+        echo ""
+    done
+}
+
+# Check eth-docker client versions
+ethd_version() {
+    echo -e "${YELLOW}Checking eth-docker client versions...${NC}"
+    echo "----------------------------------------"
+
+    for node in $(get_all_names); do
+        local ip=$(get_node_ip "$node")
+        echo -e "${BLUE}[$node]${NC} ($ip)"
+        ssh -o ConnectTimeout=10 "$node" "cd ~/eth-docker && ./ethd version" 2>&1 | sed 's/^/  /'
+        echo ""
+    done
+}
+
+# Fetch latest version from GitHub
+get_latest_version() {
+    local repo=$1
+    local cache_file="$AGENT_DIR/.version_cache_$(echo $repo | tr '/' '_')"
+    local cache_age=3600  # 1 hour cache
+
+    # Check cache
+    if [ -f "$cache_file" ]; then
+        local file_age=$(($(date +%s) - $(stat -c %Y "$cache_file")))
+        if [ $file_age -lt $cache_age ]; then
+            cat "$cache_file"
+            return
+        fi
+    fi
+
+    # Fetch from GitHub
+    local version=$(curl -s "https://api.github.com/repos/$repo/releases/latest" 2>/dev/null | grep -oP '"tag_name":\s*"\K[^"]+' | head -1)
+    if [ -n "$version" ]; then
+        echo "$version" > "$cache_file"
+        echo "$version"
+    fi
+}
+
+# Show clients summary table
+clients() {
+    echo -e "${YELLOW}Ethereum Clients Summary${NC}"
+    echo -e "${BLUE}Fetching latest versions from GitHub...${NC}"
+    echo ""
+
+    # Fetch latest versions (in background for speed)
+    latest_lodestar=$(get_latest_version "ChainSafe/lodestar")
+    latest_prysm=$(get_latest_version "prysmaticlabs/prysm")
+    latest_lighthouse=$(get_latest_version "sigp/lighthouse")
+    latest_nimbus=$(get_latest_version "status-im/nimbus-eth2")
+    latest_grandine=$(get_latest_version "grandinetech/grandine")
+    latest_teku=$(get_latest_version "Consensys/teku")
+    latest_geth=$(get_latest_version "ethereum/go-ethereum")
+    latest_nethermind=$(get_latest_version "NethermindEth/nethermind")
+    latest_erigon=$(get_latest_version "erigontech/erigon")
+    latest_besu=$(get_latest_version "hyperledger/besu")
+    latest_reth=$(get_latest_version "paradigmxyz/reth")
+    latest_mevboost=$(get_latest_version "flashbots/mev-boost")
+    latest_web3signer=$(get_latest_version "Consensys/web3signer")
+
+    printf "%-14s %-24s %-24s %-22s\n" "NODE" "CONSENSUS" "EXECUTION" "MEV"
+    printf "%-14s %-24s %-24s %-22s\n" "──────────────" "────────────────────────" "────────────────────────" "──────────────────────"
+
+    for node in $(get_all_names); do
+        # Get version output
+        version_output=$(ssh -o ConnectTimeout=10 "$node" "cd ~/eth-docker && ./ethd version" 2>/dev/null)
+
+        # Parse consensus client
+        consensus=""
+        consensus_latest=""
+        consensus_name=""
+        if echo "$version_output" | grep -q "Lodestar"; then
+            ver=$(echo "$version_output" | grep -oP "Version: v[\d\.]+" | head -1)
+            ver="${ver#Version: }"
+            consensus_name="Lodestar"
+            consensus="$ver"
+            consensus_latest="$latest_lodestar"
+        elif echo "$version_output" | grep -q "Prysm"; then
+            ver=$(echo "$version_output" | grep -oP "Prysm/v[\d\.]+" | head -1)
+            ver="${ver#Prysm/}"
+            consensus_name="Prysm"
+            consensus="$ver"
+            consensus_latest="$latest_prysm"
+        elif echo "$version_output" | grep -q "Lighthouse"; then
+            ver=$(echo "$version_output" | grep -oP "Lighthouse v[\d\.]+" | head -1)
+            ver="${ver#Lighthouse }"
+            consensus_name="Lighthouse"
+            consensus="$ver"
+            consensus_latest="$latest_lighthouse"
+        elif echo "$version_output" | grep -q "Nimbus"; then
+            ver=$(echo "$version_output" | grep -oP "Nimbus beacon node v[\d\.]+" | head -1)
+            ver="${ver#Nimbus beacon node }"
+            consensus_name="Nimbus"
+            consensus="$ver"
+            consensus_latest="$latest_nimbus"
+        elif echo "$version_output" | grep -q "Grandine"; then
+            ver=$(echo "$version_output" | grep -oP "Grandine [\d\.]+" | head -1)
+            ver="${ver#Grandine }"
+            consensus_name="Grandine"
+            consensus="$ver"
+            consensus_latest="$latest_grandine"
+        elif echo "$version_output" | grep -q "Teku"; then
+            ver=$(echo "$version_output" | grep -oP "teku/v[\d\.]+" | head -1)
+            ver="${ver#teku/}"
+            consensus_name="Teku"
+            consensus="$ver"
+            consensus_latest="$latest_teku"
+        elif echo "$version_output" | grep -q "Vero"; then
+            consensus_name="Vero"
+            consensus="(VC)"
+            consensus_latest=""
+        fi
+
+        # Format consensus with latest
+        if [ -n "$consensus_latest" ] && [ "$consensus" != "$consensus_latest" ]; then
+            consensus_display="$consensus_name $consensus -> $consensus_latest"
+        else
+            consensus_display="$consensus_name $consensus"
+        fi
+
+        # Parse execution client
+        execution=""
+        execution_latest=""
+        execution_name=""
+        if echo "$version_output" | grep -q "^Geth$\|^Version:.*stable"; then
+            ver=$(echo "$version_output" | grep -oP "Version: [\d\.]+-stable" | head -1)
+            ver="${ver#Version: }"
+            ver="${ver/-stable/}"
+            execution_name="Geth"
+            execution="v$ver"
+            execution_latest="$latest_geth"
+        elif echo "$version_output" | grep -q "Nethermind"; then
+            ver=$(echo "$version_output" | grep -oP "Version:\s+[\d\.]+" | head -1)
+            ver="${ver#Version:     }"
+            execution_name="Nethermind"
+            execution="$ver"
+            execution_latest="$latest_nethermind"
+        elif echo "$version_output" | grep -q "erigon"; then
+            ver=$(echo "$version_output" | grep -oP "erigon version [\d\.]+" | head -1)
+            ver="${ver#erigon version }"
+            execution_name="Erigon"
+            execution="v$ver"
+            execution_latest="$latest_erigon"
+        elif echo "$version_output" | grep -q "Besu"; then
+            ver=$(echo "$version_output" | grep -oP "besu/v[\d\.]+" | head -1)
+            ver="${ver#besu/}"
+            execution_name="Besu"
+            execution="$ver"
+            execution_latest="$latest_besu"
+        elif echo "$version_output" | grep -q "reth"; then
+            ver=$(echo "$version_output" | grep -oP "reth [\d\.]+" | head -1)
+            ver="${ver#reth }"
+            execution_name="Reth"
+            execution="v$ver"
+            execution_latest="$latest_reth"
+        elif echo "$version_output" | grep -q "web3signer"; then
+            ver=$(echo "$version_output" | grep -oP "web3signer/v[\d\.]+" | head -1)
+            ver="${ver#web3signer/}"
+            execution_name="web3signer"
+            execution="$ver"
+            execution_latest="$latest_web3signer"
+        fi
+
+        # Format execution with latest
+        if [ -n "$execution_latest" ] && [ "$execution" != "$execution_latest" ]; then
+            execution_display="$execution_name $execution -> $execution_latest"
+        else
+            execution_display="$execution_name $execution"
+        fi
+
+        # Parse MEV
+        mev=""
+        mev_latest=""
+        mev_name=""
+        if echo "$version_output" | grep -q "mev-boost"; then
+            ver=$(echo "$version_output" | grep -oP "mev-boost v[\d\.]+" | head -1)
+            ver="${ver#mev-boost }"
+            mev_name="mev-boost"
+            mev="$ver"
+            mev_latest="$latest_mevboost"
+        elif echo "$version_output" | grep -q "commit-boost"; then
+            ver=$(echo "$version_output" | grep -oP "commit-boost-pbs [\d\.]+" | head -1)
+            ver="${ver#commit-boost-pbs }"
+            mev_name="cb-pbs"
+            mev="v$ver"
+            mev_latest=""
+        fi
+
+        # Format mev with latest
+        if [ -n "$mev_latest" ] && [ "$mev" != "$mev_latest" ]; then
+            mev_display="$mev_name $mev -> $mev_latest"
+        else
+            mev_display="$mev_name $mev"
+        fi
+
+        printf "%-14s %-24s %-24s %-22s\n" "$node" "$consensus_display" "$execution_display" "$mev_display"
+    done
+    echo ""
+    echo -e "${BLUE}Note: '->' indicates update available${NC}"
+}
+
+# View eth-docker logs for a node
+ethd_logs() {
+    local node=$1
+    local lines=${2:-50}
+    if [ -z "$node" ]; then
+        echo "Usage: eth-agent ethd-logs <node-name> [lines]"
+        list
+        return 1
+    fi
+    local ip=$(get_node_ip "$node")
+    if [ -z "$ip" ]; then
+        echo -e "${RED}Node '$node' not found${NC}"
+        return 1
+    fi
+
+    echo -e "${BLUE}[$node]${NC} Last $lines log lines..."
+    ssh -o ConnectTimeout=10 "$node" "cd ~/eth-docker && docker compose logs --tail=$lines"
+}
+
+# Restart eth-docker stack
+ethd_restart() {
+    local node=$1
+    if [ -z "$node" ]; then
+        echo -e "${YELLOW}Restarting eth-docker on all nodes...${NC}"
+        echo "----------------------------------------"
+        for n in $(get_all_names); do
+            echo -e "${BLUE}[$n]${NC} Restarting..."
+            ssh -o ConnectTimeout=30 "$n" "cd ~/eth-docker && ./ethd restart" 2>&1 | sed 's/^/  /'
+            echo ""
+        done
+    else
+        local ip=$(get_node_ip "$node")
+        if [ -z "$ip" ]; then
+            echo -e "${RED}Node '$node' not found${NC}"
+            return 1
+        fi
+        echo -e "${BLUE}[$node]${NC} Restarting eth-docker..."
+        ssh -o ConnectTimeout=30 "$node" "cd ~/eth-docker && ./ethd restart"
+    fi
+}
+
+# Stop eth-docker stack
+ethd_stop() {
+    local node=$1
+    if [ -z "$node" ]; then
+        echo -e "${YELLOW}Stopping eth-docker on all nodes...${NC}"
+        run_on_all "cd ~/eth-docker && ./ethd stop"
+    else
+        run_on_node "$node" "cd ~/eth-docker && ./ethd stop"
+    fi
+}
+
+# Start eth-docker stack
+ethd_start() {
+    local node=$1
+    if [ -z "$node" ]; then
+        echo -e "${YELLOW}Starting eth-docker on all nodes...${NC}"
+        run_on_all "cd ~/eth-docker && ./ethd up -d"
+    else
+        run_on_node "$node" "cd ~/eth-docker && ./ethd up -d"
+    fi
+}
+
+# Get sync status
+sync_status() {
+    echo -e "${YELLOW}Checking sync status...${NC}"
+    echo "----------------------------------------"
+
+    for node in $(get_all_names); do
+        local ip=$(get_node_ip "$node")
+        echo -e "${BLUE}[$node]${NC}"
+        ssh -o ConnectTimeout=10 "$node" "curl -s -X POST -H 'Content-Type: application/json' \
+            --data '{\"jsonrpc\":\"2.0\",\"method\":\"eth_syncing\",\"params\":[],\"id\":1}' \
+            http://localhost:8545 2>/dev/null | jq -r '.result' || echo '  Unable to query'" 2>&1 | sed 's/^/  /'
+        echo ""
+    done
+}
+
+# Get block number
+block_number() {
+    echo -e "${YELLOW}Checking block numbers...${NC}"
+    echo "----------------------------------------"
+
+    for node in $(get_all_names); do
+        local ip=$(get_node_ip "$node")
+        block=$(ssh -o ConnectTimeout=10 "$node" "curl -s -X POST -H 'Content-Type: application/json' \
+            --data '{\"jsonrpc\":\"2.0\",\"method\":\"eth_blockNumber\",\"params\":[],\"id\":1}' \
+            http://localhost:8545 2>/dev/null | jq -r '.result'" 2>/dev/null)
+        if [ -n "$block" ] && [ "$block" != "null" ]; then
+            decimal=$((16#${block#0x}))
+            echo -e "${GREEN}[$node]${NC} Block: $decimal"
+        else
+            echo -e "${RED}[$node]${NC} Unable to query"
+        fi
+    done
+}
+
+# List nodes in memory
+list() {
+    echo -e "${YELLOW}Ethereum Nodes:${NC}"
+    echo "----------------------------------------"
+    jq -r '.nodes[] | "  \(.name)\t\(.tailscale_ip)"' "$NODES_FILE" | column -t
+}
+
+# SSH into a node
+connect() {
+    local node=$1
+    if [ -z "$node" ]; then
+        echo "Usage: eth-agent connect <node-name>"
+        list
+        return 1
+    fi
+    local ip=$(get_node_ip "$node")
+    if [ -z "$ip" ]; then
+        echo -e "${RED}Node '$node' not found${NC}"
+        return 1
+    fi
+    echo -e "${BLUE}Connecting to $node ($ip)...${NC}"
+    ssh "$node"
+}
+
+# Show disk usage
+disk() {
+    echo -e "${YELLOW}Disk usage on all nodes...${NC}"
+    echo ""
+    printf "%-14s %-12s %-12s %-8s %-12s %-12s %-8s\n" "NODE" "ROOT USED" "ROOT SIZE" "ROOT %" "DATA USED" "DATA SIZE" "DATA %"
+    printf "%-14s %-12s %-12s %-8s %-12s %-12s %-8s\n" "──────────────" "────────────" "────────────" "────────" "────────────" "────────────" "────────"
+
+    for node in $(get_all_names); do
+        # Get root disk
+        root_info=$(ssh -o ConnectTimeout=10 "$node" "df -h / | tail -1 | awk '{print \$3,\$2,\$5}'" 2>/dev/null)
+        root_used=$(echo "$root_info" | awk '{print $1}')
+        root_size=$(echo "$root_info" | awk '{print $2}')
+        root_pct=$(echo "$root_info" | awk '{print $3}')
+
+        # Get data disk (check common mount points)
+        data_info=$(ssh -o ConnectTimeout=10 "$node" "df -h | grep -E '/mnt/(docker|ethereum|data)|/var/lib/docker' | grep -v overlay | head -1 | awk '{print \$3,\$2,\$5}'" 2>/dev/null)
+        if [ -n "$data_info" ]; then
+            data_used=$(echo "$data_info" | awk '{print $1}')
+            data_size=$(echo "$data_info" | awk '{print $2}')
+            data_pct=$(echo "$data_info" | awk '{print $3}')
+        else
+            data_used="-"
+            data_size="-"
+            data_pct="-"
+        fi
+
+        printf "%-14s %-12s %-12s %-8s %-12s %-12s %-8s\n" "$node" "$root_used" "$root_size" "$root_pct" "$data_used" "$data_size" "$data_pct"
+    done
+    echo ""
+}
+
+# Show help
+help() {
+    echo "Ethereum Node Management Agent"
+    echo ""
+    echo "Usage: eth-agent <command> [options]"
+    echo ""
+    echo "Node Commands:"
+    echo "  list                 List all nodes in memory"
+    echo "  status               Check online status of all nodes"
+    echo "  connect <node>       SSH into a specific node"
+    echo "  disk                 Show disk usage on all nodes"
+    echo "  run <cmd>            Run command on all nodes"
+    echo "  run-on <node> <cmd>  Run command on specific node"
+    echo ""
+    echo "System Update Commands:"
+    echo "  update-all           Update apt packages on all nodes"
+    echo "  update-node <node>   Update apt packages on specific node"
+    echo ""
+    echo "Eth-Docker Commands:"
+    echo "  ethd-update          Update eth-docker on all nodes (ethd update && ethd up)"
+    echo "  ethd-update-node <n> Update eth-docker on specific node"
+    echo "  ethd-status          Show eth-docker container status on all nodes"
+    echo "  ethd-version         Show full client version details"
+    echo "  clients              Show clients summary table"
+    echo "  ethd-logs <node> [n] Show last n log lines from node (default 50)"
+    echo "  ethd-restart [node]  Restart eth-docker stack (all or specific)"
+    echo "  ethd-start [node]    Start eth-docker stack (all or specific)"
+    echo "  ethd-stop [node]     Stop eth-docker stack (all or specific)"
+    echo ""
+    echo "Ethereum RPC Commands:"
+    echo "  sync-status          Check sync status via RPC on all nodes"
+    echo "  block                Get current block number from all nodes"
+    echo ""
+    echo "  help                 Show this help"
+}
+
+# Main
+case "$1" in
+    list)
+        list
+        ;;
+    status)
+        status
+        ;;
+    eth-status)
+        eth_status
+        ;;
+    sync-status)
+        sync_status
+        ;;
+    block)
+        block_number
+        ;;
+    disk)
+        disk
+        ;;
+    connect)
+        connect "$2"
+        ;;
+    run)
+        shift
+        run_on_all "$@"
+        ;;
+    run-on)
+        shift
+        run_on_node "$@"
+        ;;
+    update-all)
+        update_all
+        ;;
+    update-node)
+        update_node "$2"
+        ;;
+    restart)
+        restart_eth "$2"
+        ;;
+    # Eth-docker commands
+    ethd-update)
+        ethd_update_all
+        ;;
+    ethd-update-node)
+        ethd_update_node "$2"
+        ;;
+    ethd-status)
+        ethd_status
+        ;;
+    ethd-version)
+        ethd_version
+        ;;
+    clients)
+        clients
+        ;;
+    ethd-logs)
+        ethd_logs "$2" "$3"
+        ;;
+    ethd-restart)
+        ethd_restart "$2"
+        ;;
+    ethd-start)
+        ethd_start "$2"
+        ;;
+    ethd-stop)
+        ethd_stop "$2"
+        ;;
+    help|--help|-h|"")
+        help
+        ;;
+    *)
+        echo -e "${RED}Unknown command: $1${NC}"
+        help
+        exit 1
+        ;;
+esac
